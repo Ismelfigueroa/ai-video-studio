@@ -1,0 +1,75 @@
+"""Release exports fail closed when a private or symlinked file is added to the list."""
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import re
+import unittest
+from unittest.mock import patch
+
+path=Path(__file__).resolve().parents[1]/'scripts/export_release.py'
+spec=importlib.util.spec_from_file_location('release_export',path)
+export=importlib.util.module_from_spec(spec);spec.loader.exec_module(export)
+check_spec=importlib.util.spec_from_file_location('release_check',path.with_name('check_release.py'))
+release_check=importlib.util.module_from_spec(check_spec);check_spec.loader.exec_module(release_check)
+
+class ReleaseConsistencyTests(unittest.TestCase):
+    def setUp(self):
+        self.files=dict(export.sources())
+    def test_release_versions_and_empty_seeds_agree(self):
+        self.assertEqual(release_check.verify(self.files),json.loads(self.files['package.json'])['version'])
+    def test_install_docs_cannot_hardcode_a_tag(self):
+        for name in ['README.md','INSTALL_PROMPT.md','docs/PILOT.md','SETUP.md']:
+            files=self.files.copy();files[name]=files[name]+b'\nUse tag v0.1.0-beta.6.\n'
+            with self.subTest(name=name),self.assertRaisesRegex(ValueError,'Hardcoded installation tag'):release_check.verify(files)
+    def test_readme_and_install_prompt_share_one_prompt(self):
+        for old,new in [(b'Do not publish my work.',b'Do not publish anything.'),(b'Preserve existing files.',b'Keep existing files.')]:
+            files=self.files.copy();files['INSTALL_PROMPT.md']=files['INSTALL_PROMPT.md'].replace(old,new)
+            with self.subTest(change=new),self.assertRaisesRegex(ValueError,'identical starter prompt'):release_check.verify(files)
+    def test_old_interface_cannot_ship(self):
+        for name in ['style-library/dist/index.html','STATUS.md','BRIEF.md','PROJECT_CONTEXT.md']:
+            files=self.files.copy();version=json.loads(files['package.json'])['version']
+            files[name]=files[name].replace(version.encode(),b'0.0.0-outdated')
+            with self.subTest(name=name),self.assertRaises(ValueError):release_check.verify(files)
+    def test_lock_drift_is_rejected(self):
+        lock=json.loads(self.files['package-lock.json']);lock['packages']['']['version']='0.0.0'
+        self.files['package-lock.json']=json.dumps(lock).encode()
+        with self.assertRaisesRegex(ValueError,'lock versions'):release_check.verify(self.files)
+    def test_populated_starter_seeds_cannot_ship(self):
+        for name,key in [('catalog','entries'),('catalog','techniques'),('projects','projects')]:
+            files=self.files.copy();path='style-library/'+name+'.example.json';value=json.loads(files[path]);value[key]=[{'id':'private-owner-fixture'}];files[path]=json.dumps(value).encode()
+            with self.subTest(key=key),self.assertRaisesRegex(ValueError,'owner data'):release_check.verify(files)
+
+class ReleaseTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
+        self.patch=patch.object(export,'ROOT',self.root);self.patch.start()
+        (self.root/'README.md').write_text('A clean project.')
+    def tearDown(self):self.patch.stop();self.tmp.cleanup()
+    def select(self,text):(self.root/'release-files.txt').write_text(text)
+    def test_exact_allowlist_omits_unlisted_owner_data(self):
+        (self.root/'private.mp4').write_bytes(b'private fixture')
+        self.select('README.md\n')
+        self.assertEqual([n for n,_ in export.sources()],['README.md'])
+    def test_private_registry_media_and_credentials_are_rejected(self):
+        legacy=self.root/'style-library/references/demo/intake.md';legacy.parent.mkdir(parents=True);legacy.write_text('Private reference notes')
+        for name in ['style-library/dist/assets/reference-previews/cover.svg','style-library/reference-notes.json','style-library/writing-voice.json','style-library/collections.json','style-library/catalog.json','projects/demo/STATUS.md','references/demo/source.mp4','style-library/references/demo/intake.md','.env','secret.key','../outside.md']:
+            self.select(name+'\n')
+            with self.subTest(name=name),self.assertRaises(ValueError):export.sources()
+    def test_symlinks_and_duplicate_paths_are_rejected(self):
+        (self.root/'alias.md').symlink_to(self.root/'README.md')
+        for value in ['alias.md\n','README.md\nREADME.md\n']:
+            self.select(value)
+            with self.assertRaises(ValueError):export.sources()
+    def test_secret_candidate_stops_export(self):
+        (self.root/'README.md').write_text('sk-'+'x'*30)
+        self.select('README.md\n')
+        with self.assertRaisesRegex(ValueError,'Credential candidate'):export.sources()
+    def test_export_contains_the_interface_dependencies(self):
+        actual=Path(__file__).resolve().parents[1]
+        with patch.object(export,'ROOT',actual):
+            files=dict(export.sources())
+        html=files['style-library/dist/index.html'].decode()
+        for name in re.findall(r'(?:src|href)="([^"?#]+\.(?:js|css))"',html):
+            if name=='launch.js':continue  # Generated by start.py for this installation.
+            self.assertIn('style-library/dist/'+name,files)

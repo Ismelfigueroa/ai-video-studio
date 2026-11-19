@@ -1,0 +1,74 @@
+"""Read-only version, empty-seed and exact-source-tree release checks."""
+import argparse
+import importlib.util
+import json
+from pathlib import Path
+import re
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def verify(files):
+    def data(name):
+        return json.loads(files[name])
+    version = data('package.json')['version']
+    if not re.fullmatch(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?', version):
+        raise ValueError('Use a numbered release version without local build metadata.')
+    lock = data('package-lock.json')
+    if lock['version'] != version or lock['packages']['']['version'] != version:
+        raise ValueError('Package/lock versions disagree.')
+    html = files['style-library/dist/index.html'].decode()
+    if re.findall(r'<meta name="studio-version" content="([^"]+)"', html) != [version]:
+        raise ValueError('Installed interface version disagrees with package.json.')
+    if 'Local preview' in html:
+        raise ValueError('Published interface still says Local preview.')
+    # Installation docs are version-free: the starter prompt installs the newest published release (betas included).
+    for name in ['README.md', 'INSTALL_PROMPT.md', 'docs/PILOT.md', 'SETUP.md']:
+        if re.search(r'\bv\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?', files[name].decode()):
+            raise ValueError('Hardcoded installation tag in ' + name + '; keep the starter prompt version-free')
+    # The prompt may wrap across lines for readability; it runs from "Set up AI Video Studio from" to "Do not publish my work."
+    prompts = [re.findall(r'^Set up AI Video Studio from .*?Do not publish my work\.$', files[name].decode(), re.M | re.S)
+               for name in ['README.md', 'INSTALL_PROMPT.md']]
+    if any(len(found) != 1 for found in prompts) or prompts[0] != prompts[1]:
+        raise ValueError('README.md and INSTALL_PROMPT.md need one identical starter prompt')
+    if 'newest published release, including beta releases' not in ' '.join(prompts[0][0].split()):
+        raise ValueError('The starter prompt must install the newest published release, including betas')
+    # Plain current-version labels that new users and assistants read first.
+    number = r'(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)'
+    for name, label in [('STATUS.md', r'^# AI Video Studio — '), ('BRIEF.md', r'Current release:\s*'), ('PROJECT_CONTEXT.md', r'version \*\*')]:
+        if re.findall(label + number, files[name].decode(), re.M) != [version]:
+            raise ValueError('Wrong current version label in ' + name)
+    catalog = data('style-library/catalog.example.json')
+    projects = data('style-library/projects.example.json')
+    if catalog.get('entries') != [] or catalog.get('techniques') != [] or catalog.get('removed_references'):
+        raise ValueError('Starter reference/technique seeds contain owner data.')
+    if projects.get('projects') != []:
+        raise ValueError('Starter project seed contains owner data.')
+    return version
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--git-ref', help='Also require this committed tree to equal the reviewed source.')
+    args = parser.parse_args()
+    spec = importlib.util.spec_from_file_location('release_export', ROOT / 'scripts/export_release.py')
+    export = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(export)
+    files = dict(export.sources())
+    version = verify(files)
+    if args.git_ref:
+        commit = subprocess.check_output(['git', 'rev-parse', '--verify', args.git_ref + '^{commit}'], cwd=ROOT, text=True).strip()
+        names = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', commit], cwd=ROOT, text=True).splitlines()
+        if set(names) != set(files):
+            raise ValueError('Git tree differs from source allowlist: ' + repr(sorted(set(names) ^ set(files))))
+        for name, expected in files.items():
+            actual = subprocess.check_output(['git', 'show', commit + ':' + name], cwd=ROOT)
+            if actual != expected:
+                raise ValueError('Committed content differs: ' + name)
+    print(json.dumps({'version': version, 'source_files': len(files), 'empty_seeds': True,
+                      'git_ref_checked': args.git_ref, 'read_only': True}))
+
+
+if __name__ == '__main__':
+    main()
